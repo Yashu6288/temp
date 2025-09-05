@@ -1,47 +1,99 @@
 import streamlit as st
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+from typing import Tuple, Dict, List
+from PIL import Image
+from streamlit_ldap_authenticator import Authenticate, LoginConfig
+import warnings
 
-st.set_page_config(page_title="Oracle Table Manager", page_icon="🗄️", layout="wide")
-
-# ----------------------------- DB helpers -----------------------------
-def sql_alchemy(username, password, host, port, sid):
-    dialect = "oracle"
-    driver = "oracledb"
-    engine_path = f"{dialect}+{driver}://{username}:{password}@{host}:{port}/?service_name={sid}"
-    return create_engine(engine_path)
-
-def get_data(engine):
-    df1 = pd.read_sql_query("SELECT * FROM ACCESS_PORTAL_GROUP_MASTER", engine)
-    df2 = pd.read_sql_query("SELECT * FROM ACCESS_PORTAL_USER_MASTER", engine)
-    return df1, df2
-
-# ----------------------------- Utilities -----------------------------
+##################################################################  Page Configuration  ###############################################################################
+image = Image.open('./.streamlit/logo.webp')
+st.set_page_config(
+page_title="Oracle Admin – Access Portal",
+page_icon="🗄️",
+layout="wide",
+initial_sidebar_state="expanded",
+menu_items={
+    'About': "## Admin Portal\n **Contact**: Yashuvardhan Patel (Systems)\n **Report a bug**: Email - yashuvardhan.patel@asianpaints.com"
+})
+warnings.simplefilter(action='ignore', category=FutureWarning)
+#######################################################################  Authentication  ######################################################################################
+auth =  Authenticate(st.secrets['ldap'],
+    st.secrets['session_state_names'],
+    st.secrets['auth_cookie'])
+user = auth.login(config=LoginConfig(align="center", title="🗄️ Admin – Access Portal", formType='default'))
+# ============================ CONFIG / CONSTANTS ============================
 ID_COL = "_row_id"
+TABLE_GROUP = "ACCESS_PORTAL_GROUP_MASTER"
+TABLE_USER  = "ACCESS_PORTAL_USER_MASTER"
 
+COL_GROUP_KEY = "user_group"   # PK of group table
+COL_HOME_DIR  = "home_dir"
+COL_FOLDER    = "folder_names"
+
+COL_USER_ID   = "user_id"      # PK of user table
+COL_USER_GRP  = "user_group"   # FK -> group.user_group
+
+# ============================ DB HELPERS ====================================
+def sql_alchemy_from_secrets():
+    """
+    Reads Streamlit secrets and returns a SQLAlchemy engine for Oracle using 'oracledb'.
+    Supports either 'service_name' OR 'sid' in secrets.
+    """
+    username = st.secrets["Database"]["username"]
+    password = st.secrets["Database"]["password"]
+    host = st.secrets["Database"]["host"]
+    port = st.secrets["Database"]["port"]
+    sid = st.secrets["Database"]["sid"]
+
+    DIALECT = 'oracle'
+    SQL_DRIVER = 'oracledb'
+    USERNAME = username
+    PASSWORD = password
+    HOST = host
+    PORT = port 
+    SERVICE = sid
+    ENGINE_PATH_WIN_AUTH = DIALECT + '+' + SQL_DRIVER + '://' + USERNAME + ':' + PASSWORD +'@' + HOST + ':' + str(PORT) + '/?service_name=' + SERVICE
+
+    engine = create_engine(ENGINE_PATH_WIN_AUTH)
+    return engine
+
+def fetch_data(engine) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    df_group = pd.read_sql_query(f'SELECT * FROM {TABLE_GROUP}', engine)
+    df_user  = pd.read_sql_query(f'SELECT * FROM {TABLE_USER}', engine)
+    df_group.columns = df_group.columns.str.lower()
+    df_user.columns = df_user.columns.str.lower()
+    return df_group, df_user
+
+# ============================ UTILITIES =====================================
 def with_row_id(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # Assign stable integer ids for this session
     df[ID_COL] = range(len(df))
     return df
 
-def next_row_id(current_df: pd.DataFrame) -> int:
-    return (int(current_df[ID_COL].max()) + 1) if not current_df.empty else 0
-
 def clean_grid_df(df_like) -> pd.DataFrame:
     df = pd.DataFrame(df_like).copy()
-    # Drop AgGrid metadata if present
     df = df.drop(columns=["::auto_unique_id::", "_selectedRowNodeInfo"], errors="ignore")
     return df
 
-def build_grid_options(df: pd.DataFrame, *, editable=True, selectable=True) -> dict:
+def build_grid_options(df: pd.DataFrame, *, editable=True, selectable=True, select_options: Dict[str, List[str]] = None) -> dict:
     gb = GridOptionsBuilder.from_dataframe(df)
     gb.configure_default_column(editable=editable, resizable=True, filter=True)
-    gb.configure_column(ID_COL, editable=False, hide=True)  # keep ID hidden but available for selection
+    gb.configure_column(ID_COL, editable=False, hide=True)
     if selectable:
         gb.configure_selection(selection_mode="multiple", use_checkbox=True)
     gb.configure_grid_options(domLayout="autoHeight")
+    # Configure select dropdowns (e.g., user_group on user table)
+    if select_options:
+        for col, opts in select_options.items():
+            gb.configure_column(
+                col,
+                editable=True,
+                cellEditor="agSelectCellEditor",
+                cellEditorParams={"values": opts},
+                filter=True
+            )
     return gb.build()
 
 def align_dtypes_like(target: pd.DataFrame, reference: pd.DataFrame, exclude_cols=None) -> pd.DataFrame:
@@ -52,308 +104,505 @@ def align_dtypes_like(target: pd.DataFrame, reference: pd.DataFrame, exclude_col
             try:
                 target[col] = target[col].astype(reference[col].dtype)
             except Exception:
-                # If cast fails (e.g., invalid strings), skip to avoid crashing
                 pass
     return target
 
 def compute_changes(current: pd.DataFrame, original: pd.DataFrame):
-    """
-    Returns tuple: (added_rows, edited_rows, deleted_rows) as DataFrames.
-    Uses ID_COL to compare, ignores ID_COL in content comparison.
-    """
+    """Return (added, edited, deleted) using ID_COL as key; ignores ID_COL in comparisons."""
     if ID_COL not in current.columns or ID_COL not in original.columns:
-        raise ValueError(f"Missing '{ID_COL}' in frames for change detection.")
-
+        raise ValueError(f"Missing '{ID_COL}'")
     cur = current.copy()
     orig = original.copy()
-
-    # Ensure ID is integer-like
     cur[ID_COL] = pd.to_numeric(cur[ID_COL], errors="coerce").astype("Int64")
     orig[ID_COL] = pd.to_numeric(orig[ID_COL], errors="coerce").astype("Int64")
 
-    # Added: in current, not in original
-    added_ids = set(cur[ID_COL]) - set(orig[ID_COL])
-    added_rows = cur[cur[ID_COL].isin(list(added_ids))].reset_index(drop=True)
-
-    # Deleted: in original, not in current
+    added_ids   = set(cur[ID_COL]) - set(orig[ID_COL])
     deleted_ids = set(orig[ID_COL]) - set(cur[ID_COL])
-    deleted_rows = orig[orig[ID_COL].isin(list(deleted_ids))].reset_index(drop=True)
+    common_ids  = list(set(cur[ID_COL]) & set(orig[ID_COL]))
 
-    # Edited: intersection where any non-ID column differs
-    common_ids = list(set(cur[ID_COL]) & set(orig[ID_COL]))
+    added   = cur[cur[ID_COL].isin(list(added_ids))].reset_index(drop=True)
+    deleted = orig[orig[ID_COL].isin(list(deleted_ids))].reset_index(drop=True)
+
     if not common_ids:
-        edited_rows = pd.DataFrame(columns=cur.columns)
+        edited = pd.DataFrame(columns=cur.columns)
     else:
-        cur_idxed = cur.set_index(ID_COL, drop=False)
-        orig_idxed = orig.set_index(ID_COL, drop=False)
-
-        # Ensure same columns to compare (ignore ID_COL)
+        cur_idx  = cur.set_index(ID_COL, drop=False)
+        orig_idx = orig.set_index(ID_COL, drop=False)
         compare_cols = [c for c in cur.columns if c in orig.columns and c != ID_COL]
-        # Align dtypes to reduce false positives
-        cur_idxed[compare_cols] = align_dtypes_like(cur_idxed[compare_cols], orig_idxed[compare_cols]).copy()
-
-        cur_common = cur_idxed.loc[common_ids, compare_cols]
-        orig_common = orig_idxed.loc[common_ids, compare_cols]
-
-        changed_mask = (cur_common != orig_common).any(axis=1)
+        cur_idx[compare_cols] = align_dtypes_like(cur_idx[compare_cols], orig_idx[compare_cols]).copy()
+        changed_mask = (cur_idx.loc[common_ids, compare_cols] != orig_idx.loc[common_ids, compare_cols]).any(axis=1)
         changed_ids = changed_mask[changed_mask].index.tolist()
-        edited_rows = cur_idxed.loc[changed_ids].reset_index(drop=True)
+        edited = cur_idx.loc[changed_ids].reset_index(drop=True)
 
-    return added_rows, edited_rows, deleted_rows
+    return added, edited, deleted
 
-def type_aware_input(col_name: str, dtype, key: str):
-    """Render an appropriate input widget based on dtype and return value."""
-    kind = str(dtype)
-    if "int" in kind:
-        return st.number_input(col_name, value=0, step=1, key=key)
-    if "float" in kind:
-        return st.number_input(col_name, value=0.0, step=0.01, key=key, format="%.6f")
-    if "bool" in kind:
-        return st.checkbox(col_name, value=False, key=key)
-    if "datetime" in kind or "date" in kind:
-        # Store as ISO string to avoid timezone issues unless your schema expects datetime
-        d = st.date_input(col_name, key=key)
-        return pd.to_datetime(d)
-    # Fallback to text
-    return st.text_input(col_name, value="", key=key)
+def fk_validate_users(df_user: pd.DataFrame, valid_groups: List[str]) -> List[str]:
+    """Return list of errors for invalid user_group references."""
+    errors = []
+    invalid = df_user[~df_user[COL_USER_GRP].isin(valid_groups)]
+    for _, row in invalid.iterrows():
+        errors.append(f"User '{row[COL_USER_ID]}' refers to unknown group '{row[COL_USER_GRP]}'.")
+    return errors
 
-# ----------------------------- Main app -----------------------------
-def main():
-    # Branding header
+def guard_group_deletes(deleted_groups: pd.DataFrame, engine) -> List[str]:
+    """Block deletion of groups that are still used by any user."""
+    if deleted_groups.empty:
+        return []
+    groups = tuple(deleted_groups[COL_GROUP_KEY].astype(str).unique())
+    # Build safe IN clause
+    if len(groups) == 1:
+        in_clause = f"('{groups[0]}')"
+    else:
+        in_clause = "(" + ",".join([f":g{i}" for i in range(len(groups))]) + ")"
+
+    sql = text(f"""
+        SELECT {COL_USER_GRP}, COUNT(*) as CNT
+        FROM {TABLE_USER}
+        WHERE {COL_USER_GRP} IN {in_clause}
+        GROUP BY {COL_USER_GRP}
+    """)
+    params = {f"g{i}": g for i, g in enumerate(groups)} if len(groups) > 1 else {}
+    with engine.begin() as conn:
+        res = conn.execute(sql, params).fetchall()
+    if not res:
+        return []
+    in_use = {r[0]: r[1] for r in res}
+    return [f"Group '{g}' is in use by {cnt} user(s) and cannot be deleted." for g, cnt in in_use.items()]
+# ============================ DB APPLY (CRUD) ================================
+def apply_group_changes(engine, added: pd.DataFrame, edited: pd.DataFrame, deleted: pd.DataFrame):
+    """Apply CRUD to group table in a single transaction."""
+    with engine.begin() as conn:
+        # Deletes (safe only if not referenced – already guarded before calling)
+        for _, row in deleted.iterrows():
+            conn.execute(
+                text(f"DELETE FROM {TABLE_GROUP} WHERE {COL_GROUP_KEY} = :k"),
+                {"k": row[COL_GROUP_KEY]}
+            )
+        # Updates
+        for _, row in edited.iterrows():
+            conn.execute(
+                text(f"""
+                    UPDATE {TABLE_GROUP}
+                    SET {COL_HOME_DIR} = :home_dir,
+                        {COL_FOLDER}  = :folder
+                    WHERE {COL_GROUP_KEY} = :k
+                """),
+                {
+                    "home_dir": row[COL_HOME_DIR],
+                    "folder": row[COL_FOLDER],
+                    "k": row[COL_GROUP_KEY],
+                }
+            )
+        # Inserts
+        for _, row in added.iterrows():
+            conn.execute(
+                text(f"""
+                    INSERT INTO ACCESS_PORTAL_GROUP_MASTER (USER_GROUP, HOME_DIR, FOLDER_NAMES)
+                        VALUES (:k, :home_dir, :folder)
+                """),
+                {
+                    "k": row[COL_GROUP_KEY],
+                    "home_dir": row[COL_HOME_DIR],
+                    "folder": row[COL_FOLDER],
+                }
+            )
+
+def apply_user_changes(engine, added: pd.DataFrame, edited: pd.DataFrame, deleted: pd.DataFrame):
+    """Apply CRUD to user table in a single transaction."""
+    with engine.begin() as conn:
+        # Deletes
+        for _, row in deleted.iterrows():
+            conn.execute(
+                text(f"DELETE FROM {TABLE_USER} WHERE {COL_USER_ID} = :uid"),
+                {"uid": row[COL_USER_ID]}
+            )
+        # Updates
+        for _, row in edited.iterrows():
+            conn.execute(
+                text(f"""
+                    UPDATE {TABLE_USER}
+                    SET {COL_USER_GRP} = :grp
+                    WHERE {COL_USER_ID} = :uid
+                """),
+                {"grp": row[COL_USER_GRP], "uid": row[COL_USER_ID]}
+            )
+        # Inserts
+        for _, row in added.iterrows():
+            conn.execute(
+                text(f"""
+                    INSERT INTO {TABLE_USER} ({COL_USER_ID}, {COL_USER_GRP})
+                    VALUES (:uid, :grp)
+                """),
+                {"uid": row[COL_USER_ID], "grp": row[COL_USER_GRP]}
+            )
+
+# ============================ UI HELPERS ====================================
+def header():
+    st.markdown(
+            """
+            <style>
+                .stMainBlockContainer iframe{
+                position:relative !important;
+                top:9vh !important;  
+                }
+
+                .stMainBlockContainer{
+                    padding: 3rem 2rem 10rem !important;
+                }
+            </style>
+
+            <style>
+        
+            .stSidebar button {
+                background-color: transparent !important;
+                border: none !important;
+                cursor: pointer;
+                width: auto;
+                text-decoration: underline !important;
+                transition:0.2s !important;
+            } 
+            .stSidebar button:hover {
+                transition:0.2s !important;
+                background-color: lightgray !important;
+            }
+            .stSidebar button:active {
+                transition:0.2s !important;
+                color: black !important;
+            }
+        
+            .stSidebar .stExpander > details{
+                border-style: none !important;
+            }
+        
+            .stSidebar .stPopover > div > button > div > p {
+                font-size: 18px !important;
+            }
+        
+            .stSidebar .stExpander > details > summary > span > div > p {
+                font-size: 18px !important;
+            
+            }
+    
+            .stAppHeader{
+                display:None !important;
+            }
+    
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
     st.markdown(
         """
         <style>
         .big-title { font-size: 28px; font-weight: 700; margin-bottom: 0.2rem; }
         .subtle { color: #666; margin-top: 0; }
-        .toolbar .stButton>button { border-radius: 6px; }
-        .apply-area .stButton>button { font-weight: 600; }
+        .toolbar .stButton>button { border-radius: 8px; padding: 0.4rem 0.8rem; }
+        .apply-area .stButton>button { font-weight: 700; }
+        .ag-theme-streamlit { --ag-row-height: 25px; }
         </style>
         """,
         unsafe_allow_html=True,
     )
-    st.markdown('<div class="big-title">🗄️ Oracle Table Manager</div>', unsafe_allow_html=True)
-    st.markdown('<p class="subtle">Curate and control your master data with confident, auditable changes.</p>', unsafe_allow_html=True)
+    st.markdown(
+    """
+    <style>
+    /* Reduce vertical space between main content elements */
+    .block-container {
+        padding-top: 1rem !important;
+        padding-bottom: 1rem !important;
+    }
 
-    # DB connection
-    username = st.secrets["Database"]["username"]
-    password = st.secrets["Database"]["password"]
-    host = st.secrets["Database"]["host"]
-    port = st.secrets["Database"]["port"]
-    sid = st.secrets["Database"]["sid"]
+    /* Reduce space between markdown/text elements */
+    .stMarkdown, .stText, .stSelectbox, .stButton, .stDataFrame {
+        margin-bottom: 0.5rem !important;
+    }
 
-    engine = sql_alchemy(username, password, host, port, sid)
-    df1_base, df2_base = get_data(engine)
+    /* Optional: tighten expander content spacing */
+    .stExpander > div {
+        padding-top: 0.25rem !important;
+        padding-bottom: 0.25rem !important;
+    }
 
-    # Initialize session state
-    if "orig_df1" not in st.session_state:
-        st.session_state.orig_df1 = with_row_id(df1_base)
-        st.session_state.df1 = st.session_state.orig_df1.copy()
-        st.session_state.next_id1 = next_row_id(st.session_state.df1)
-        st.session_state.show_add1 = False
+    /* Optional: tighten form elements */
+    .stForm {
+        gap: 0.5rem !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+    )
+    col_temp1, col_temp2 = st.columns([6, 1])
+    with col_temp1:
+        st.markdown('<div class="big-title">🗄️ Access Portal Admin</div>', unsafe_allow_html=True)
+        st.markdown('<p class="subtle">Manage groups and users with validation & safe, auditable updates.</p>', unsafe_allow_html=True)
+    with col_temp2:
+        auth.createLogoutForm()
 
-    if "orig_df2" not in st.session_state:
-        st.session_state.orig_df2 = with_row_id(df2_base)
-        st.session_state.df2 = st.session_state.orig_df2.copy()
-        st.session_state.next_id2 = next_row_id(st.session_state.df2)
-        st.session_state.show_add2 = False
+def add_form(df_ref: pd.DataFrame, form_key: str, exclude_cols: List[str] = None, title="Add new row"):
+    exclude_cols = set(exclude_cols or [])
+    with st.form(form_key, clear_on_submit=True):
+        st.markdown(f"##### {title}")
+        new_row = {}
+        for col in df_ref.columns:
+            if col in exclude_cols:
+                continue
+            dtype = df_ref[col].dtype if col in df_ref.columns else object
+            kind = str(dtype)
+            key = f"{form_key}_{col}"
+            if col == COL_USER_GRP and COL_USER_GRP in df_ref.columns:
+                # this path only used if you call with a df that contains COL_USER_GRP
+                pass
+            if "int" in kind:
+                new_row[col] = st.number_input(col, step=1, value=0, key=key)
+            elif "float" in kind:
+                new_row[col] = st.number_input(col, step=0.01, value=0.0, key=key, format="%.6f")
+            else:
+                new_row[col] = st.text_input(col, value="", key=key)
+        submitted = st.form_submit_button("Add")
+        return submitted, new_row
+# ============================ MAIN APP ======================================
+def main():
+    df_admin = pd.read_excel("admin_details.xlsx")
+    admin_list = df_admin['Pid'].tolist()
+    if user is not None:
+        user_pid = user['sAMAccountName']
+        if (user_pid) in (admin_list):
+            header()
+            engine = sql_alchemy_from_secrets()
+            g_raw, u_raw = fetch_data(engine)
 
-    # Tabs per table
-    tab1, tab2 = st.tabs(["📋 Group Master", "👤 User Master"])
+            # Maintain original snapshots
+            if "orig_group" not in st.session_state:
+                st.session_state.orig_group = with_row_id(g_raw)
+                st.session_state.group = st.session_state.orig_group.copy()
+            if "orig_user" not in st.session_state:
+                st.session_state.orig_user = with_row_id(u_raw)
+                st.session_state.user = st.session_state.orig_user.copy()
 
-    # ------------- Table 1 -------------
-    with tab1:
-        st.subheader("Group Master")
-        with st.container():
-            # Toolbar
-            tcol1, tcol2, tcol3 = st.columns([1, 1, 5], gap="small")
-            with tcol1:
-                if st.button("➕ Add Row", key="add_btn1"):
-                    st.session_state.show_add1 = True
-            with tcol2:
-                if st.button("↩️ Reset Changes", key="reset_btn1"):
-                    st.session_state.df1 = st.session_state.orig_df1.copy()
-                    st.session_state.next_id1 = next_row_id(st.session_state.df1)
-                    st.session_state.show_add1 = False
-                    st.success("Group Master reset to original snapshot.")
+            valid_groups = sorted(st.session_state.group[COL_GROUP_KEY].astype(str).unique().tolist())
 
-            # Add form (type-aware)
-            if st.session_state.show_add1:
-                with st.form("add_form1", clear_on_submit=True):
-                    st.markdown("##### Add new row")
-                    new_row = {}
-                    for col in st.session_state.df1.columns:
-                        if col == ID_COL:
-                            continue
-                        # Use original dtypes as baseline
-                        dtype_ref = st.session_state.orig_df1[col].dtype if col in st.session_state.orig_df1.columns else object
-                        new_row[col] = type_aware_input(col, dtype_ref, key=f"f1_{col}")
-                    submitted = st.form_submit_button("Add")
+            tab_g, tab_u = st.tabs(["📋 Group Master", "👤 User Master"])
+
+            # ------------------------- GROUP MASTER TAB -------------------------
+            with tab_g:
+                st.subheader("Group Master")
+                t1a, t1b, t1c = st.columns([1, 4, 6])
+                with t1a:
+                    if st.button("➕ Add Row", key="g_add"):
+                        st.session_state["show_g_add"] = True
+                with t1b:
+                    a , b = st.columns([1,4])
+                    with a:
+                        if st.button("↩️ Reset", key="g_reset"):
+                            st.session_state.group = st.session_state.orig_group.copy()
+                            st.session_state["show_g_add"] = False
+                            st.toast("Group Master reset to original snapshot.")
+                    # with del_col_g:
+                    with b:
+                        delete_button = st.button("🗑️ Delete Selected", key="g_del")
+                if st.session_state.get("show_g_add", False):
+                    # Simple add form; ID_COL is excluded
+                    submitted, new_row = add_form(
+                        st.session_state.orig_group.drop(columns=[ID_COL]),
+                        "g_add_form",
+                        exclude_cols=[ID_COL],
+                        title="Add Group"
+                    )
                     if submitted:
-                        new_row[ID_COL] = st.session_state.next_id1
-                        st.session_state.next_id1 += 1
-                        st.session_state.df1 = pd.concat([st.session_state.df1, pd.DataFrame([new_row])], ignore_index=True)
-                        st.session_state.show_add1 = False
-                        st.success("Row added.")
+                        # Ensure required fields exist
+                        for required in [COL_GROUP_KEY]:
+                            if not str(new_row.get(required, "")).strip():
+                                st.error(f"'{required}' is required.")
+                                st.stop()
+                        # Prevent dupes in-session
+                        existing = st.session_state.group[st.session_state.group[COL_GROUP_KEY].astype(str) == str(new_row[COL_GROUP_KEY])]
+                        if not existing.empty:
+                            st.error(f"Group '{new_row[COL_GROUP_KEY]}' already exists in current view.")
+                        else:
+                            # assign a new row id
+                            new_row[ID_COL] = (st.session_state.group[ID_COL].max() + 1) if not st.session_state.group.empty else 0
+                            st.session_state.group = pd.concat([st.session_state.group, pd.DataFrame([new_row])], ignore_index=True)
+                            st.session_state["show_g_add"] = False
+                            st.toast("Group added to pending changes.")
 
-            # Grid
-            grid1_options = build_grid_options(st.session_state.df1, editable=True, selectable=True)
-            grid_return1 = AgGrid(
-                st.session_state.df1,
-                gridOptions=grid1_options,
-                update_mode=GridUpdateMode.NO_UPDATE,
-                data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                fit_columns_on_grid_load=True,
-                theme="streamlit",
-            )
+                grid_opts_g = build_grid_options(
+                    st.session_state.group,
+                    editable=True,
+                    selectable=True
+                )
+                
+                ret_g = AgGrid(
+                    st.session_state.group,
+                    gridOptions=grid_opts_g,
+                    update_mode=GridUpdateMode.NO_UPDATE,
+                    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                    fit_columns_on_grid_load=True,
+                    theme="streamlit",
+                    allow_unsafe_jscode=False
+                )
+                edited_g = clean_grid_df(ret_g["data"])
+                edited_g = edited_g[[c for c in st.session_state.group.columns if c in edited_g.columns]]
+                st.session_state.group = edited_g.copy()
 
-            # Persist inline edits from grid to session state
-            edited_view1 = clean_grid_df(grid_return1["data"])
-            # Reorder columns to match df1 to avoid accidental compare issues
-            edited_view1 = edited_view1[[c for c in st.session_state.df1.columns if c in edited_view1.columns]]
-            st.session_state.df1 = edited_view1.copy()
+                del_col_g, _ = st.columns([1, 7])
+                if delete_button:
+                        sel = ret_g.get("selected_rows", [])
+                        try:
+                            if len(sel)>0:
+                                sel_ids = sel[ID_COL].dropna().tolist()
+                                st.session_state.group = st.session_state.group[~st.session_state.group[ID_COL].isin(sel_ids)]
+                                st.toast(f"Marked {len(sel_ids)} row(s) for deletion.")
+                        except:
+                            st.warning("No rows selected.")
+                
 
-            # Delete Selected (must be after grid to capture selection)
-            dcol1, dcol2 = st.columns([1, 9])
-            with dcol1:
-                if st.button("🗑️ Delete Selected", key="del_btn1"):
-                    selected = grid_return1["selected_rows"]
-                    if isinstance(selected, list) and len(selected) > 0:
-                        sel_ids = []
-                        for row in selected:
-                            # Fallback if _row_id is missing (shouldn't be, but safer)
-                            rid = row.get(ID_COL, None)
-                            if rid is not None:
-                                sel_ids.append(rid)
-                        if sel_ids:
-                            st.session_state.df1 = st.session_state.df1[~st.session_state.df1[ID_COL].isin(sel_ids)]
-                            st.success(f"Deleted {len(sel_ids)} row(s).")
-                    else:
+            # ------------------------- USER MASTER TAB -------------------------
+            with tab_u:
+                st.subheader("User Master")
+                t2a, t2b, t2c = st.columns([1, 4, 6])
+                with t2a:
+                    if st.button("➕ Add Row", key="u_add"):
+                        st.session_state["show_u_add"] = True
+                with t2b:
+                    a , b = st.columns([1,4])
+                    with a:
+                        if st.button("↩️ Reset", key="u_reset"):
+                            st.session_state.user = st.session_state.orig_user.copy()
+                            st.session_state["show_u_add"] = False
+                            st.toast("User Master reset to original snapshot.")
+                    with b:
+                        delete_button1 = st.button("🗑️ Delete Selected", key="u_del")
+                if st.session_state.get("show_u_add", False):
+                    with st.form("u_add_form", clear_on_submit=True):
+                        st.markdown("##### Add User")
+                        uid = st.text_input(COL_USER_ID, "")
+                        grp = st.selectbox(COL_USER_GRP, options=valid_groups, index=0 if valid_groups else None)
+                        if st.form_submit_button("Add"):
+                            if not uid.strip():
+                                st.error("User ID is required.")
+                            elif grp is None:
+                                st.error("Please select a group.")
+                            elif (st.session_state.user[COL_USER_ID].astype(str) == uid).any():
+                                st.error(f"User '{uid}' already exists in current view.")
+                            else:
+                                new_row = {COL_USER_ID: uid, COL_USER_GRP: grp, ID_COL: (st.session_state.user[ID_COL].max() + 1) if not st.session_state.user.empty else 0}
+                                st.session_state.user = pd.concat([st.session_state.user, pd.DataFrame([new_row])], ignore_index=True)
+                                st.session_state["show_u_add"] = False
+                                st.toast("User added to pending changes.")
+
+                # AgGrid with dropdown editor for user_group
+                grid_opts_u = build_grid_options(
+                    st.session_state.user,
+                    editable=True,
+                    selectable=True,
+                    select_options={COL_USER_GRP: valid_groups}
+                )
+                ret_u = AgGrid(
+                    st.session_state.user,
+                    gridOptions=grid_opts_u,
+                    update_mode=GridUpdateMode.NO_UPDATE,
+                    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                    fit_columns_on_grid_load=True,
+                    theme="streamlit",
+                    allow_unsafe_jscode=False
+                )
+                edited_u = clean_grid_df(ret_u["data"])
+                edited_u = edited_u[[c for c in st.session_state.user.columns if c in edited_u.columns]]
+                st.session_state.user = edited_u.copy()
+
+                del_col_u, _ = st.columns([1, 7])
+                #with del_col_u:
+                if delete_button1:
+                    sel = ret_u.get("selected_rows", [])
+                    try:
+                        if len(sel)>0:
+                            sel_ids = sel[ID_COL].dropna().tolist()
+                            st.session_state.user = st.session_state.user[~st.session_state.user[ID_COL].isin(sel_ids)]
+                            st.toast(f"Marked {len(sel_ids)} row(s) for deletion.")
+                    except:
                         st.warning("No rows selected.")
+            st.divider()
 
-    # ------------- Table 2 -------------
-    with tab2:
-        st.subheader("User Master")
-        with st.container():
-            # Toolbar
-            t2col1, t2col2, t2col3 = st.columns([1, 1, 5], gap="small")
-            with t2col1:
-                if st.button("➕ Add Row", key="add_btn2"):
-                    st.session_state.show_add2 = True
-            with t2col2:
-                if st.button("↩️ Reset Changes", key="reset_btn2"):
-                    st.session_state.df2 = st.session_state.orig_df2.copy()
-                    st.session_state.next_id2 = next_row_id(st.session_state.df2)
-                    st.session_state.show_add2 = False
-                    st.success("User Master reset to original snapshot.")
+            # ===================== APPLY CHANGES (DB WRITE) =====================
+            c1, c2 = st.columns([1, 6])
+            with c1:
+                if st.button("✅ Apply All Changes", width='stretch'):
+                    # Compute diffs
+                    g_added, g_edited, g_deleted = compute_changes(st.session_state.group.drop_duplicates(subset=[ID_COL]), st.session_state.orig_group.drop_duplicates(subset=[ID_COL]))
+                    u_added, u_edited, u_deleted = compute_changes(st.session_state.user.drop_duplicates(subset=[ID_COL]),  st.session_state.orig_user.drop_duplicates(subset=[ID_COL]))
 
-            # Add form (type-aware)
-            if st.session_state.show_add2:
-                with st.form("add_form2", clear_on_submit=True):
-                    st.markdown("##### Add new row")
-                    new_row2 = {}
-                    for col in st.session_state.df2.columns:
-                        if col == ID_COL:
-                            continue
-                        dtype_ref = st.session_state.orig_df2[col].dtype if col in st.session_state.orig_df2.columns else object
-                        new_row2[col] = type_aware_input(col, dtype_ref, key=f"f2_{col}")
-                    submitted2 = st.form_submit_button("Add")
-                    if submitted2:
-                        new_row2[ID_COL] = st.session_state.next_id2
-                        st.session_state.next_id2 += 1
-                        st.session_state.df2 = pd.concat([st.session_state.df2, pd.DataFrame([new_row2])], ignore_index=True)
-                        st.session_state.show_add2 = False
-                        st.success("Row added.")
+                    # Validate foreign keys for user table (added + edited)
+                    pending_user = pd.concat([u_added, u_edited], ignore_index=True) if not u_added.empty or not u_edited.empty else pd.DataFrame(columns=st.session_state.user.columns)
+                    fk_errors = fk_validate_users(pending_user[[COL_USER_ID, COL_USER_GRP]], valid_groups)
+                    # Guard group deletions
+                    guard_errors = guard_group_deletes(g_deleted[[COL_GROUP_KEY]], engine)
 
-            # Grid
-            grid2_options = build_grid_options(st.session_state.df2, editable=True, selectable=True)
-            grid_return2 = AgGrid(
-                st.session_state.df2,
-                gridOptions=grid2_options,
-                update_mode=GridUpdateMode.NO_UPDATE,
-                data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                fit_columns_on_grid_load=True,
-                theme="streamlit",
-            )
+                    if fk_errors or guard_errors:
+                        st.error("Cannot apply changes due to following issues:")
+                        for e in fk_errors + guard_errors:
+                            st.write(f"- {e}")
+                        st.stop()
 
-            # Persist inline edits from grid
-            edited_view2 = clean_grid_df(grid_return2["data"])
-            edited_view2 = edited_view2[[c for c in st.session_state.df2.columns if c in edited_view2.columns]]
-            st.session_state.df2 = edited_view2.copy()
+                    # Apply in safe order:
+                    # 1) Apply GROUP changes (inserts/updates) before USER inserts/updates (for FK)
+                    # 2) Apply USER deletes before GROUP deletes (for FK)
+                    try:
+                        # First: apply group adds/edits
+                        apply_group_changes(engine, g_added, g_edited, pd.DataFrame(columns=g_deleted.columns))
+                        # Then: apply user adds/edits/deletes (delete first to free FK if users moved)
+                        apply_user_changes(engine, pd.DataFrame(columns=u_added.columns), pd.DataFrame(columns=u_edited.columns), u_deleted)
+                        apply_user_changes(engine, u_added, u_edited, pd.DataFrame(columns=u_deleted.columns))
+                        # Finally: group deletes (already guarded)
+                        apply_group_changes(engine, pd.DataFrame(columns=g_added.columns), pd.DataFrame(columns=g_edited.columns), g_deleted)
+                    except Exception as ex:
+                        st.exception(ex)
+                        st.stop()
 
-            # Delete Selected
-            ddcol1, ddcol2 = st.columns([1, 9])
-            with ddcol1:
-                if st.button("🗑️ Delete Selected", key="del_btn2"):
-                    selected2 = grid_return2["selected_rows"]
-                    if isinstance(selected2, list) and len(selected2) > 0:
-                        sel_ids2 = []
-                        for row in selected2:
-                            rid = row.get(ID_COL, None)
-                            if rid is not None:
-                                sel_ids2.append(rid)
-                        if sel_ids2:
-                            st.session_state.df2 = st.session_state.df2[~st.session_state.df2[ID_COL].isin(sel_ids2)]
-                            st.success(f"Deleted {len(sel_ids2)} row(s).")
-                    else:
-                        st.warning("No rows selected.")
+                    st.toast("✅ Changes applied to Oracle successfully.")
 
-    st.divider()
+                    # Refresh base snapshots from DB
+                    g_raw2, u_raw2 = fetch_data(engine)
+                    st.session_state.orig_group = with_row_id(g_raw2)
+                    st.session_state.group = st.session_state.orig_group.copy()
 
-    # Apply All Changes (shows diff vs original)
-    apply_col1, apply_col2 = st.columns([1, 6])
-    with apply_col1:
-        if st.button("✅ Apply All Changes", use_container_width=True):
-            # Compute changes against original snapshots
-            cur1 = st.session_state.df1.copy()
-            orig1 = st.session_state.orig_df1.copy()
-            cur2 = st.session_state.df2.copy()
-            orig2 = st.session_state.orig_df2.copy()
+                    st.session_state.orig_user = with_row_id(u_raw2)
+                    st.session_state.user = st.session_state.orig_user.copy()
 
-            added1, edited1, deleted1 = compute_changes(cur1, orig1)
-            added2, edited2, deleted2 = compute_changes(cur2, orig2)
+                    # Update valid groups for UI
+                    st.session_state["show_g_add"] = False
+                    st.session_state["show_u_add"] = False
 
-            st.subheader("Changes Summary")
 
-            # Group Master summary
-            st.markdown("##### Group Master")
-            c1a, c1b, c1c = st.columns(3)
-            c1a.metric("Added", len(added1))
-            c1b.metric("Edited", len(edited1))
-            c1c.metric("Deleted", len(deleted1))
-            if len(added1) > 0:
-                st.write("Added rows")
-                st.dataframe(added1, use_container_width=True, height=200)
-            if len(edited1) > 0:
-                st.write("Edited rows")
-                st.dataframe(edited1, use_container_width=True, height=200)
-            if len(deleted1) > 0:
-                st.write("Deleted rows")
-                st.dataframe(deleted1, use_container_width=True, height=200)
-            if len(added1) == len(edited1) == len(deleted1) == 0:
-                st.info("No changes detected in Group Master.")
+            with c2:
+                # Live diff summary
+                g_added, g_edited, g_deleted = compute_changes(st.session_state.group, st.session_state.orig_group)
+                u_added, u_edited, u_deleted = compute_changes(st.session_state.user,  st.session_state.orig_user)
 
-            st.markdown("---")
+                st.caption("Pending changes preview (before applying):")
 
-            # User Master summary
-            st.markdown("##### User Master")
-            c2a, c2b, c2c = st.columns(3)
-            c2a.metric("Added", len(added2))
-            c2b.metric("Edited", len(edited2))
-            c2c.metric("Deleted", len(deleted2))
-            if len(added2) > 0:
-                st.write("Added rows")
-                st.dataframe(added2, use_container_width=True, height=200)
-            if len(edited2) > 0:
-                st.write("Edited rows")
-                st.dataframe(edited2, use_container_width=True, height=200)
-            if len(deleted2) > 0:
-                st.write("Deleted rows")
-                st.dataframe(deleted2, use_container_width=True, height=200)
-            if len(added2) == len(edited2) == len(deleted2) == 0:
-                st.info("No changes detected in User Master.")
+                st.markdown("**Group Master**")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Added", len(g_added))
+                m2.metric("Edited", len(g_edited))
+                m3.metric("Deleted", len(g_deleted))
+                if len(g_added):   st.dataframe(g_added.drop(columns=[ID_COL]), width='stretch', height=160)
+                if len(g_edited):  st.dataframe(g_edited.drop(columns=[ID_COL]), width='stretch', height=160)
+                if len(g_deleted): st.dataframe(g_deleted.drop(columns=[ID_COL]), width='stretch', height=160)
+                if len(g_added) == len(g_edited) == len(g_deleted) == 0:
+                    st.info("No pending changes in Group Master.")
 
-    with apply_col2:
-        st.caption("Review all pending changes. You can reset each table to the original snapshot before applying to your database layer.")
-
+                st.markdown("---")
+                st.markdown("**User Master**")
+                n1, n2, n3 = st.columns(3)
+                n1.metric("Added", len(u_added))
+                n2.metric("Edited", len(u_edited))
+                n3.metric("Deleted", len(u_deleted))
+                if len(u_added):   st.dataframe(u_added.drop(columns=[ID_COL]), width='stretch', height=160)
+                if len(u_edited):  st.dataframe(u_edited.drop(columns=[ID_COL]), width='stretch', height=160)
+                if len(u_deleted): st.dataframe(u_deleted.drop(columns=[ID_COL]), width='stretch', height=160)
+                if len(u_added) == len(u_edited) == len(u_deleted) == 0:
+                    st.info("No pending changes in User Master.")
+        else:
+            st.warning('Sorry your not Admin!')
 if __name__ == "__main__":
     main()
